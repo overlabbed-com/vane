@@ -1,0 +1,210 @@
+[
+  {
+    "finding_id": "T-01/E-01",
+    "original_severity": "CRITICAL",
+    "severity_assessment": "CRITICAL - Race condition in user creation/linking (TOCTOU)",
+    "rationale": "Classic Time-of-Check-Time-of-Use race condition in callback/route.ts lines 150-169. Two concurrent OAuth callbacks for the same Google user can both pass getUserByGoogleId() as null, then both pass getUserByEmail() as null, resulting in duplicate user creation. This is both a Tampering (T-01) finding (data modification via race) and Privilege Escalation (E-01) finding (duplicate accounts enable account takeover via linking race).",
+    "additional_vectors": [
+      "Request A and Request B both check getUserByGoogleId() → null within same 10ms window",
+      "Both pass getUserByEmail() → null",
+      "Both call createUserWithGoogle() → duplicate user created",
+      "Attacker can link second account to existing email account for privilege escalation"
+    ],
+    "mitigation_adequacy": "INADEQUATE - MOCK database has no atomicity, no unique constraints, no transactions. Production requires PostgreSQL with unique constraint on google_id or Redis distributed lock.",
+    "mitigation_gaps": [
+      "No database-level unique constraint on google_id",
+      "No atomic upsert operation",
+      "No transaction wrapper around check-create sequence",
+      "No Redis distributed lock as fallback",
+      "MOCK database pattern will cause race conditions in production"
+    ],
+    "strategic_trade_offs": {
+      "simplicity": "MOCK in-memory Map is simple but not safe for concurrent access",
+      "performance": "PostgreSQL FOR UPDATE row lock adds latency but ensures correctness",
+      "complexity": "Redis distributed lock adds infrastructure dependency"
+    },
+    "recommendation": "IMPLEMENT IMMEDIATELY - Use PostgreSQL unique constraint on google_id with atomic upsert. Add Redis distributed lock as fallback for high availability. Replace MOCK users.ts with production PostgreSQL implementation before launch."
+  },
+  {
+    "finding_id": "S-02",
+    "original_severity": "CRITICAL",
+    "severity_assessment": "CRITICAL - Session token transmitted as URL query parameter",
+    "rationale": "callback/route.ts lines 185-191 appends session.token as a URL search parameter. This exposes the session token through multiple vectors: server access logs (token in plaintext), browser history (token stored in URL), Referer header (token leaked to external sites), browser tabs/favorites (token in saved URLs), screen sharing/screenshots.",
+    "additional_vectors": [
+      "Server access logs capture token in plaintext",
+      "Browser history stores token in URL",
+      "Referer header leaks token when clicking external links",
+      "Browser tabs/favorites preserve token in saved URLs",
+      "Screen sharing exposes token in address bar"
+    ],
+    "mitigation_adequacy": "NOT IMPLEMENTED - Code still uses URL query parameter",
+    "mitigation_gaps": [
+      "Token appears in server-side logs",
+      "Token persists in browser history",
+      "Token leaks via Referer header",
+      "No HTTP-only cookie alternative implemented",
+      "Frontend still expects token from URL parameter"
+    ],
+    "strategic_trade_offs": {
+      "simplicity": "URL parameter is simple but insecure",
+      "compatibility": "Cookie requires frontend update to read from cookie instead of URL",
+      "security": "HTTP-only Secure SameSite=Strict cookie eliminates all exposure vectors"
+    },
+    "recommendation": "IMPLEMENT IMMEDIATELY - Replace URL parameter with HTTP-only, Secure, SameSite=Strict cookie. Update frontend to read session_token from cookie instead of URL param. Do NOT include token in redirect URL."
+  },
+  {
+    "finding_id": "S-03",
+    "original_severity": "HIGH",
+    "severity_assessment": "HIGH - No redirect URI validation against open redirect",
+    "rationale": "callback/route.ts line 32 uses OAUTH_SUCCESS_REDIRECT_URL directly from environment variable without validation. If the env var is compromised or misconfigured, attackers could redirect users to a phishing site after successful OAuth authentication.",
+    "additional_vectors": [
+      "Environment variable injection via supply chain attack",
+      "Misconfigured deployment pipeline",
+      "Accidental misconfiguration of OAUTH_SUCCESS_REDIRECT_URL",
+      "Phishing site receives authenticated session"
+    ],
+    "mitigation_adequacy": "NOT IMPLEMENTED - No validation of redirect URL",
+    "mitigation_gaps": [
+      "No whitelist of allowed redirect domains",
+      "No validation that redirect is relative path or allowed domain",
+      "No check for suspicious redirect patterns (//, \\, @)",
+      "No runtime validation at startup"
+    ],
+    "strategic_trade_offs": {
+      "usability": "Flexible redirect URL enables custom success pages but introduces risk",
+      "security": "Strict domain whitelist eliminates open redirect but limits flexibility",
+      "operational": "Startup validation fails fast on misconfiguration"
+    },
+    "recommendation": "IMPLEMENT BEFORE PRODUCTION - Add ALLOWED_REDIRECT_DOMAINS env var with comma-separated whitelist. Validate redirect URL at startup: must be relative path OR match allowed domain. Fail fast on invalid configuration."
+  },
+  {
+    "finding_id": "E-03",
+    "original_severity": "HIGH",
+    "severity_assessment": "HIGH - No PKCE (Proof Key for Code Exchange) implementation",
+    "rationale": "lib/auth/oauth/google.ts lines 75-95 (getGoogleAuthUrl) does not implement PKCE. On public clients (mobile apps, SPAs), the authorization code could be intercepted via URI schemes, proxy servers, or browser history. Without PKCE, authorization code interception leads directly to session token theft.",
+    "additional_vectors": [
+      "URI scheme interception on mobile apps",
+      "Proxy server logging of authorization codes",
+      "Browser history exposure of authorization URLs",
+      "Man-in-the-middle interception of authorization code"
+    ],
+    "mitigation_adequacy": "NOT IMPLEMENTED - No PKCE code in codebase",
+    "mitigation_gaps": [
+      "No code_verifier generation (32-byte random)",
+      "No code_challenge generation (SHA256 of verifier)",
+      "No code_challenge_method=S256 parameter",
+      "No cookie storage of verifier for callback",
+      "No verification of verifier in callback"
+    ],
+    "strategic_trade_offs": {
+      "complexity": "PKCE adds ~30 lines and cookie management",
+      "compatibility": "Google supports PKCE, all modern OAuth clients require it",
+      "security": "PKCE eliminates authorization code interception attack vector"
+    },
+    "recommendation": "IMPLEMENT BEFORE PRODUCTION - Add PKCE support: generate 32-byte random verifier, SHA256 hash as challenge, store verifier in httpOnly cookie, verify in callback. Required for public clients."
+  },
+  {
+    "finding_id": "S-04",
+    "original_severity": "MEDIUM",
+    "severity_assessment": "MEDIUM - No CSRF protection via state/code binding",
+    "rationale": "callback/route.ts lines 62-180 validates state nonce for CSRF but does not bind the authorization code to the state. An attacker with a valid state cookie could potentially pair it with a different authorization code, completing a CSRF attack where the victim's session is linked to the attacker's Google account.",
+    "additional_vectors": [
+      "Attacker obtains valid state nonce",
+      "Victim initiates OAuth flow",
+      "Attacker intercepts authorization code from their own flow",
+      "Attacker provides victim's state with attacker's code",
+      "Victim's session linked to attacker's Google account"
+    ],
+    "mitigation_adequacy": "PARTIAL - State nonce exists but not bound to authorization code",
+    "mitigation_gaps": [
+      "State nonce does not include code challenge",
+      "No binding between state and authorization code",
+      "Attacker can reuse state with different code",
+      "No verification that code was initiated with this state"
+    ],
+    "strategic_trade_offs": {
+      "simplicity": "Standalone state nonce is simple but less secure",
+      "security": "Code binding prevents state reuse attacks",
+      "complexity": "Hashing code into state adds complexity but strengthens security"
+    },
+    "recommendation": "IMPLEMENT BEFORE PRODUCTION - Include SHA256 hash of expected authorization code in state: state = nonceBase64.codeChallenge. In callback, verify codeChallenge matches received code. Prevents state reuse with different code."
+  },
+  {
+    "finding_id": "I-01",
+    "original_severity": "HIGH",
+    "severity_assessment": "HIGH - Error messages may leak internal details",
+    "rationale": "callback/route.ts lines 192-205 error handler logs error.message which may contain sensitive context if the error includes request details. While IP is correctly hashed, the error message itself could expose session tokens, internal paths, or other auth context to logs.",
+    "additional_vectors": [
+      "Error message contains session token from failed operation",
+      "Error message exposes internal file paths",
+      "Error message reveals Redis/database error details",
+      "Logs stored unencrypted enabling data breach exposure"
+    ],
+    "mitigation_adequacy": "PARTIAL - IP is hashed but error message not sanitized",
+    "mitigation_gaps": [
+      "error.message not truncated",
+      "No sanitization of sensitive context in errors",
+      "Full error details logged without redaction",
+      "No separation of user-facing and server-facing errors"
+    ],
+    "strategic_trade_offs": {
+      "debugging": "Full error details aid debugging but leak sensitive data",
+      "security": "Truncated errors prevent leakage but reduce debuggability",
+      "compliance": "Audit logs should not contain PII or auth secrets"
+    },
+    "recommendation": "IMPLEMENT BEFORE PRODUCTION - Truncate error.message to 100 chars, sanitize any request context, separate user-facing errors (generic) from server logs (detailed). Never log session tokens."
+  },
+  {
+    "finding_id": "D-01/D-02",
+    "original_severity": "HIGH",
+    "severity_assessment": "HIGH - No rate limiting on OAuth endpoints (initiation + callback)",
+    "rationale": "route.ts lines 47-75 (initiation) and callback/route.ts lines 62-180 (callback) have no rate limiting. An attacker could rapidly generate state nonces (D-01, exhausting Redis storage at ~100 bytes/nonce = 1GB per 10M requests) or repeatedly send callback requests with invalid codes (D-02, causing Redis ops, token exchange attempts, user lookups).",
+    "additional_vectors": [
+      "State nonce flood fills Redis storage (D-01)",
+      "Invalid callback flood causes external API calls (D-02)",
+      "Redis operations per request multiply attack impact",
+      "User enumeration via repeated callback attempts",
+      "Denial of service via resource exhaustion"
+    ],
+    "mitigation_adequacy": "NOT IMPLEMENTED - No rate limiting code in either endpoint",
+    "mitigation_gaps": [
+      "No rate limit on initiation endpoint",
+      "No rate limit on callback endpoint",
+      "No Redis-based distributed rate limiting",
+      "No tracking of attempts per IP/client",
+      "No 429 response with Retry-After header"
+    ],
+    "strategic_trade_offs": {
+      "simplicity": "No rate limiting is simple but insecure",
+      "availability": "Rate limiting prevents DoS but may affect legitimate users",
+      "accuracy": "Distributed rate limiting requires Redis but works across instances"
+    },
+    "recommendation": "IMPLEMENT BEFORE PRODUCTION - Add rate limiting to both endpoints: 10 initiations per 15 min per IP, 30 callbacks per 15 min per IP. Use Redis-backed distributed rate limiting. Return 429 with Retry-After."
+  },
+  {
+    "finding_id": "T-03-related",
+    "original_severity": "MEDIUM",
+    "severity_assessment": "MEDIUM - Cookie-based state validation lacks client binding",
+    "rationale": "lib/auth/redis.ts lines 180-230 (verifySession) HMAC integrity signatures are computed and verified, but session binding validation (IP/UA) is optional and can be disabled via SESSION_BINDING_CONFIG.enabled: false. Without mandatory session binding, stolen cookies enable session hijacking without detection.",
+    "additional_vectors": [
+      "Cookie stolen via XSS",
+      "Cookie intercepted via network sniffing",
+      "Cookie leaked via logs or backups",
+      "Attacker uses stolen cookie from different IP/UA",
+      "No detection of session theft"
+    ],
+    "mitigation_adequacy": "INADEQUATE - Session binding can be disabled via config",
+    "mitigation_gaps": [
+      "SESSION_BINDING_CONFIG.enabled is configurable (should be always on)",
+      "No mandatory enforcement in production",
+      "IP subnet and UA threshold configurable (not fixed)",
+      "Optional binding defeats the security purpose"
+    ],
+    "strategic_trade_offs": {
+      "flexibility": "Configurable binding allows testing but weakens security",
+      "security": "Mandatory binding prevents session theft without detection",
+      "usability": "Loose binding (24-bit subnet, 0.7 UA threshold) balances security and usability"
+    },
+    "recommendation": "IMPLEMENT BEFORE PRODUCTION - Make SESSION_BINDING_CONFIG.enabled always true in production (const, not variable). Set fixed values: ipSubnetBits: 24, uaMatchThreshold: 0.7. Never allow disabling in production."
+  }
+]
